@@ -802,31 +802,52 @@ double velMapping(double d, double max_v)
     return vel * max_v;
 }
 
+// ==================== 轨迹规划核心函数块 ====================
+
+/**
+ * @brief 主要轨迹规划函数
+ * 
+ * 根据配置选择Fast Marching或A*算法进行路径搜索，
+ * 然后生成飞行走廊并优化贝塞尔轨迹
+ * 
+ * 功能流程:
+ * 1. 检查规划前提条件(目标点、地图、里程计)
+ * 2. 路径搜索: FM*算法(基于速度场) 或 A*算法(基于网格)
+ * 3. 走廊生成: 为路径生成安全飞行走廊
+ * 4. 时间分配: 基于动力学约束分配各段时间
+ * 5. 轨迹优化: 使用Mosek求解器优化贝塞尔轨迹
+ */
 void trajPlanning()
 {   
+    // ========== 前提条件检查 ==========
     if( _has_target == false || _has_map == false || _has_odom == false) 
-        return;
+        return;  // 缺少必要信息，退出规划
 
-    vector<Cube> corridor;
-    if(_is_use_fm)
+    vector<Cube> corridor;  // 飞行走廊容器
+    // ========== 路径规划算法分支 ==========
+    if(_is_use_fm)  // 使用Fast Marching*算法
     {
+        // ===== 步骤1: 生成欧几里得距离变换(EDT) =====
         ros::Time time_1 = ros::Time::now();
-        float oob_value = INFINITY;
-        auto EDT = collision_map_local->ExtractDistanceField(oob_value);
+        float oob_value = INFINITY;  // 边界外区域值设为无穷大
+        auto EDT = collision_map_local->ExtractDistanceField(oob_value);  // 提取距离场
         ros::Time time_2 = ros::Time::now();
         ROS_WARN("time in generate EDT is %f", (time_2 - time_1).toSec());
 
-        unsigned int idx;
-        double max_vel = _MAX_Vel * 0.75; 
-        vector<unsigned int> obs;            
-        Vector3d pt;
-        vector<int64_t> pt_idx;
-        double flow_vel;
+        // ===== 步骤2: 构建速度场网格 =====
+        unsigned int idx;            // 网格线性索引
+        double max_vel = _MAX_Vel * 0.75;  // 最大速度(保留安全余量)
+        vector<unsigned int> obs;    // 障碍物网格索引列表           
+        Vector3d pt;                 // 当前网格点坐标
+        vector<int64_t> pt_idx;      // 点索引容器
+        double flow_vel;             // 当前点的流速度
 
+        // 网格尺寸
         unsigned int size_x = (unsigned int)(_max_x_id);
         unsigned int size_y = (unsigned int)(_max_y_id);
         unsigned int size_z = (unsigned int)(_max_z_id);
 
+        // 创建Fast Marching网格
         Coord3D dimsize {size_x, size_y, size_z};
         FMGrid3D grid_fmm(dimsize);
 
@@ -941,72 +962,86 @@ void trajPlanning()
 
         delete fm_solver;
     }
-    else
+    else  // 使用A*算法
     {   
-        path_finder->linkLocalMap(collision_map_local, _local_origin);
-        path_finder->AstarSearch(_start_pt, _end_pt);
-        vector<Vector3d> gridPath = path_finder->getPath();
-        vector<GridNodePtr> searchedNodes = path_finder->getVisitedNodes();
-        path_finder->resetLocalMap();
+        // ===== 步骤1: A*路径搜索 =====
+        path_finder->linkLocalMap(collision_map_local, _local_origin);  // 链接局部地图
+        path_finder->AstarSearch(_start_pt, _end_pt);                   // A*搜索
+        vector<Vector3d> gridPath = path_finder->getPath();             // 获取路径
+        vector<GridNodePtr> searchedNodes = path_finder->getVisitedNodes();  // 获取搜索节点
+        path_finder->resetLocalMap();                                   // 重置地图
         
-        visGridPath(gridPath);
-        visExpNode(searchedNodes);
+        // ===== 步骤2: 可视化A*结果 =====
+        visGridPath(gridPath);       // 可视化网格路径(红色)
+        visExpNode(searchedNodes);   // 可视化扩展节点(绿色)
 
+        // ===== 步骤3: 走廊生成 =====
         ros::Time time_bef_corridor = ros::Time::now();    
-        corridor = corridorGeneration(gridPath);
+        corridor = corridorGeneration(gridPath);  // 基于网格路径生成走廊
         ros::Time time_aft_corridor = ros::Time::now();
         ROS_WARN("Time consume in corridor generation is %f", (time_aft_corridor - time_bef_corridor).toSec());
 
-        timeAllocation(corridor);
-        visCorridor(corridor);
+        // ===== 步骤4: 时间分配和可视化 =====
+        timeAllocation(corridor);  // 分配各段时间
+        visCorridor(corridor);     // 可视化飞行走廊
     }
 
-    MatrixXd pos = MatrixXd::Zero(2,3);
-    MatrixXd vel = MatrixXd::Zero(2,3);
-    MatrixXd acc = MatrixXd::Zero(2,3);
+    // ========== 轨迹优化阶段 ==========
+    // ===== 边界条件设置 =====
+    MatrixXd pos = MatrixXd::Zero(2,3);  // 位置约束: 起点和终点
+    MatrixXd vel = MatrixXd::Zero(2,3);  // 速度约束: 起点速度
+    MatrixXd acc = MatrixXd::Zero(2,3);  // 加速度约束: 起点加速度
 
-    pos.row(0) = _start_pt;
-    pos.row(1) = _end_pt;    
-    vel.row(0) = _start_vel;
-    acc.row(0) = _start_acc;
+    pos.row(0) = _start_pt;   // 起点位置
+    pos.row(1) = _end_pt;     // 终点位置   
+    vel.row(0) = _start_vel;  // 起点速度
+    acc.row(0) = _start_acc;  // 起点加速度
     
-    double obj;
+    // ===== 贝塞尔轨迹优化 =====
+    double obj;  // 优化目标函数值
     ros::Time time_bef_opt = ros::Time::now();
 
+    // 调用轨迹生成器进行贝塞尔多项式系数优化
     if(_trajectoryGenerator.BezierPloyCoeffGeneration
         ( corridor, _MQM, pos, vel, acc, _MAX_Vel, _MAX_Acc, _traj_order, _minimize_order, 
          _cube_margin, _is_limit_vel, _is_limit_acc, obj, _bezier_coeff ) == -1 )
     {
-        ROS_WARN("Cannot find a feasible and optimal solution, somthing wrong with the mosek solver");
+        // ===== 优化失败处理 =====
+        ROS_WARN("Cannot find a feasible and optimal solution, something wrong with the mosek solver");
           
-        if(_has_traj && _is_emerg)
+        if(_has_traj && _is_emerg)  // 如果处于紧急状态且有旧轨迹
         {
             _traj.action = quadrotor_msgs::PolynomialTrajectory::ACTION_WARN_IMPOSSIBLE;
-            _traj_pub.publish(_traj);
-            _has_traj = false;
+            _traj_pub.publish(_traj);  // 发布警告消息
+            _has_traj = false;         // 清除轨迹标志
         } 
     }
     else
     {   
-        _seg_num = corridor.size();
-        _seg_time.resize(_seg_num);
+        // ===== 优化成功处理 =====
+        _seg_num = corridor.size();   // 轨迹段数
+        _seg_time.resize(_seg_num);   // 调整时间向量大小
 
+        // 提取各段时间
         for(int i = 0; i < _seg_num; i++)
             _seg_time(i) = corridor[i].t;
 
-        _is_emerg = false;
-        _has_traj = true;
+        // 更新状态标志
+        _is_emerg = false;   // 清除紧急状态
+        _has_traj = true;    // 标记有有效轨迹
 
-        _traj = getBezierTraj();
-        _traj_pub.publish(_traj);
-        _traj_id ++;
-        visBezierTrajectory(_bezier_coeff, _seg_time);
+        // 发布轨迹和可视化
+        _traj = getBezierTraj();                        // 生成ROS轨迹消息
+        _traj_pub.publish(_traj);                       // 发布轨迹
+        _traj_id ++;                                    // 轨迹ID递增
+        visBezierTrajectory(_bezier_coeff, _seg_time);  // 可视化轨迹
     }
 
     ros::Time time_aft_opt = ros::Time::now();
 
+    // ===== 性能统计输出 =====
     ROS_WARN("The objective of the program is %f", obj);
-    ROS_WARN("The time consumation of the program is %f", (time_aft_opt - time_bef_opt).toSec());
+    ROS_WARN("The time consumption of the program is %f", (time_aft_opt - time_bef_opt).toSec());
 }
 
 void sortPath(vector<Vector3d> & path_coord, vector<double> & time)
@@ -1158,195 +1193,289 @@ void timeAllocation(vector<Cube> & corridor)
       }
 }
 
+/**
+ * @brief 程序主入口函数
+ * 
+ * 初始化ROS节点，设置订阅者和发布者，读取参数配置，
+ * 初始化贝塞尔基函数和地图数据结构，启动主循环
+ * 
+ * @param argc 命令行参数个数
+ * @param argv 命令行参数数组
+ * @return int 程序退出状态码
+ */
 int main(int argc, char** argv)
 {
+    // ========== ROS节点初始化 ==========
     ros::init(argc, argv, "b_traj_node");
     ros::NodeHandle nh("~");
 
+    // ========== 订阅者设置 ==========
+    // 订阅点云地图数据，用于构建碰撞检测环境
     _map_sub  = nh.subscribe( "map",       1, rcvPointCloudCallBack );
+    // 订阅无人机里程计数据，获取当前位姿和速度
     _odom_sub = nh.subscribe( "odometry",  1, rcvOdometryCallbck);
+    // 订阅航点数据，触发轨迹规划
     _pts_sub  = nh.subscribe( "waypoints", 1, rcvWaypointsCallback );
 
-    _inf_map_vis_pub   = nh.advertise<sensor_msgs::PointCloud2>("vis_map_inflate", 1);
-    _local_map_vis_pub = nh.advertise<sensor_msgs::PointCloud2>("vis_map_local", 1);
-    _traj_vis_pub      = nh.advertise<visualization_msgs::Marker>("trajectory_vis", 1);    
-    _corridor_vis_pub  = nh.advertise<visualization_msgs::MarkerArray>("corridor_vis", 1);
-    _fm_path_vis_pub   = nh.advertise<visualization_msgs::MarkerArray>("path_vis", 1);
-    _grid_path_vis_pub = nh.advertise<visualization_msgs::MarkerArray>("grid_path_vis", 1);
-    _nodes_vis_pub     = nh.advertise<visualization_msgs::Marker>("expanded_nodes_vis", 1);
-    _checkTraj_vis_pub = nh.advertise<visualization_msgs::Marker>("check_trajectory", 1);
-    _stopTraj_vis_pub  = nh.advertise<visualization_msgs::Marker>("stop_trajectory", 1);
+    // ========== 发布者设置 ==========
+    // 可视化相关发布者
+    _inf_map_vis_pub   = nh.advertise<sensor_msgs::PointCloud2>("vis_map_inflate", 1);     // 膨胀后的障碍物地图
+    _local_map_vis_pub = nh.advertise<sensor_msgs::PointCloud2>("vis_map_local", 1);       // 局部地图
+    _traj_vis_pub      = nh.advertise<visualization_msgs::Marker>("trajectory_vis", 1);     // 轨迹可视化
+    _corridor_vis_pub  = nh.advertise<visualization_msgs::MarkerArray>("corridor_vis", 1);  // 飞行走廊可视化
+    _fm_path_vis_pub   = nh.advertise<visualization_msgs::MarkerArray>("path_vis", 1);      // Fast Marching路径可视化
+    _grid_path_vis_pub = nh.advertise<visualization_msgs::MarkerArray>("grid_path_vis", 1); // A*网格路径可视化
+    _nodes_vis_pub     = nh.advertise<visualization_msgs::Marker>("expanded_nodes_vis", 1);  // A*扩展节点可视化
+    _checkTraj_vis_pub = nh.advertise<visualization_msgs::Marker>("check_trajectory", 1);   // 轨迹安全检查可视化
+    _stopTraj_vis_pub  = nh.advertise<visualization_msgs::Marker>("stop_trajectory", 1);    // 紧急停止轨迹可视化
 
+    // 轨迹输出发布者
     _traj_pub = nh.advertise<quadrotor_msgs::PolynomialTrajectory>("trajectory", 10);
 
-    nh.param("map/margin",     _cloud_margin, 0.25);
-    nh.param("map/resolution", _resolution, 0.2);
+    // ========== 参数配置读取 ==========
+    // 地图相关参数
+    nh.param("map/margin",     _cloud_margin, 0.25);  // 障碍物膨胀边距(m)
+    nh.param("map/resolution", _resolution, 0.2);     // 地图分辨率(m)
     
-    nh.param("map/x_size",       _x_size, 50.0);
-    nh.param("map/y_size",       _y_size, 50.0);
-    nh.param("map/z_size",       _z_size, 5.0 );
+    // 全局地图尺寸
+    nh.param("map/x_size",       _x_size, 50.0);      // X方向地图尺寸(m)
+    nh.param("map/y_size",       _y_size, 50.0);      // Y方向地图尺寸(m)
+    nh.param("map/z_size",       _z_size, 5.0 );      // Z方向地图尺寸(m)
     
-    nh.param("map/x_local_size", _x_local_size, 20.0);
-    nh.param("map/y_local_size", _y_local_size, 20.0);
-    nh.param("map/z_local_size", _z_local_size, 5.0 );
+    // 局部地图尺寸
+    nh.param("map/x_local_size", _x_local_size, 20.0); // X方向局部地图尺寸(m)
+    nh.param("map/y_local_size", _y_local_size, 20.0); // Y方向局部地图尺寸(m)
+    nh.param("map/z_local_size", _z_local_size, 5.0 ); // Z方向局部地图尺寸(m)
 
-    nh.param("planning/init_x",       _init_x,  0.0);
-    nh.param("planning/init_y",       _init_y,  0.0);
-    nh.param("planning/init_z",       _init_z,  0.0);
+    // 规划器初始位置参数
+    nh.param("planning/init_x",       _init_x,  0.0);  // 初始X坐标(m)
+    nh.param("planning/init_y",       _init_y,  0.0);  // 初始Y坐标(m)
+    nh.param("planning/init_z",       _init_z,  0.0);  // 初始Z坐标(m)
     
-    nh.param("planning/max_vel",       _MAX_Vel,  1.0);
-    nh.param("planning/max_acc",       _MAX_Acc,  1.0);
-    nh.param("planning/max_inflate",   _max_inflate_iter, 100);
-    nh.param("planning/step_length",   _step_length,     2);
-    nh.param("planning/cube_margin",   _cube_margin,   0.2);
-    nh.param("planning/check_horizon", _check_horizon,10.0);
-    nh.param("planning/stop_horizon",  _stop_horizon,  5.0);
-    nh.param("planning/is_limit_vel",  _is_limit_vel,  false);
-    nh.param("planning/is_limit_acc",  _is_limit_acc,  false);
-    nh.param("planning/is_use_fm",     _is_use_fm,  true);
+    // 动力学约束参数
+    nh.param("planning/max_vel",       _MAX_Vel,  1.0); // 最大速度(m/s)
+    nh.param("planning/max_acc",       _MAX_Acc,  1.0); // 最大加速度(m/s²)
+    
+    // 走廊生成参数
+    nh.param("planning/max_inflate",   _max_inflate_iter, 100); // 立方体膨胀最大迭代次数
+    nh.param("planning/step_length",   _step_length,     2);    // 膨胀步长(网格单位)
+    nh.param("planning/cube_margin",   _cube_margin,   0.2);    // 立方体边距(m)
+    
+    // 安全检查参数
+    nh.param("planning/check_horizon", _check_horizon,10.0);    // 轨迹前瞻检查时间(s)
+    nh.param("planning/stop_horizon",  _stop_horizon,  5.0);    // 紧急停止检查时间(s)
+    
+    // 约束开关
+    nh.param("planning/is_limit_vel",  _is_limit_vel,  false);  // 是否限制速度
+    nh.param("planning/is_limit_acc",  _is_limit_acc,  false);  // 是否限制加速度
+    nh.param("planning/is_use_fm",     _is_use_fm,  true);      // 是否使用Fast Marching (否则用A*)
 
-    nh.param("optimization/min_order",  _minimize_order, 3.0);
-    nh.param("optimization/poly_order", _traj_order,    10);
+    // 轨迹优化参数
+    nh.param("optimization/min_order",  _minimize_order, 3.0);  // 最小化阶数(通常为snap: 3阶导数)
+    nh.param("optimization/poly_order", _traj_order,    10);    // 贝塞尔曲线阶数
 
-    nh.param("vis/vis_traj_width", _vis_traj_width, 0.15);
-    nh.param("vis/is_proj_cube",   _is_proj_cube, true);
+    // 可视化参数
+    nh.param("vis/vis_traj_width", _vis_traj_width, 0.15);     // 轨迹可视化线宽
+    nh.param("vis/is_proj_cube",   _is_proj_cube, true);       // 是否将立方体投影到地面
 
+    // ========== 贝塞尔基函数初始化 ==========
     Bernstein _bernstein;
+    // 设置贝塞尔基函数参数: 最小阶数3, 最大阶数12, 优化阶数
     if(_bernstein.setParam(3, 12, _minimize_order) == -1)
         ROS_ERROR(" The trajectory order is set beyond the library's scope, please re-set "); 
 
-    _MQM = _bernstein.getMQM()[_traj_order];
-    _FM  = _bernstein.getFM()[_traj_order];
-    _C   = _bernstein.getC()[_traj_order];
-    _Cv  = _bernstein.getC_v()[_traj_order];
-    _Ca  = _bernstein.getC_a()[_traj_order];
-    _Cj  = _bernstein.getC_j()[_traj_order];
+    // 获取指定阶数的贝塞尔基函数系数矩阵
+    _MQM = _bernstein.getMQM()[_traj_order];    // 最小化二次型矩阵 (用于优化)
+    _FM  = _bernstein.getFM()[_traj_order];     // 映射矩阵 (贝塞尔到多项式)
+    _C   = _bernstein.getC()[_traj_order];      // 位置基函数系数
+    _Cv  = _bernstein.getC_v()[_traj_order];    // 速度基函数系数
+    _Ca  = _bernstein.getC_a()[_traj_order];    // 加速度基函数系数
+    _Cj  = _bernstein.getC_j()[_traj_order];    // 急动度基函数系数
 
+    // ========== 地图坐标系统初始化 ==========
+    // 设置地图原点(地图中心为坐标原点)
     _map_origin << -_x_size/2.0, -_y_size/2.0, 0.0;
-    _pt_max_x = + _x_size / 2.0;
-    _pt_min_x = - _x_size / 2.0;
-    _pt_max_y = + _y_size / 2.0;
-    _pt_min_y = - _y_size / 2.0; 
-    _pt_max_z = + _z_size;
-    _pt_min_z = 0.0;
+    // 设置地图边界
+    _pt_max_x = + _x_size / 2.0;  // X正方向边界
+    _pt_min_x = - _x_size / 2.0;  // X负方向边界
+    _pt_max_y = + _y_size / 2.0;  // Y正方向边界
+    _pt_min_y = - _y_size / 2.0;  // Y负方向边界
+    _pt_max_z = + _z_size;        // Z正方向边界(地面以上)
+    _pt_min_z = 0.0;              // Z负方向边界(地面)
 
-    _inv_resolution = 1.0 / _resolution;
+    // ========== 网格参数计算 ==========
+    _inv_resolution = 1.0 / _resolution;  // 分辨率倒数(用于坐标转换)
+    // 全局地图网格数量
     _max_x_id = (int)(_x_size * _inv_resolution);
     _max_y_id = (int)(_y_size * _inv_resolution);
     _max_z_id = (int)(_z_size * _inv_resolution);
+    // 局部地图网格数量  
     _max_local_x_id = (int)(_x_local_size * _inv_resolution);
     _max_local_y_id = (int)(_y_local_size * _inv_resolution);
     _max_local_z_id = (int)(_z_local_size * _inv_resolution);
 
-    Vector3i GLSIZE(_max_x_id, _max_y_id, _max_z_id);
-    Vector3i LOSIZE(_max_local_x_id, _max_local_y_id, _max_local_z_id);
+    // ========== 路径查找器初始化 ==========
+    Vector3i GLSIZE(_max_x_id, _max_y_id, _max_z_id);        // 全局地图尺寸
+    Vector3i LOSIZE(_max_local_x_id, _max_local_y_id, _max_local_z_id);  // 局部地图尺寸
 
+    // 创建A*路径查找器并初始化网格节点地图
     path_finder = new gridPathFinder(GLSIZE, LOSIZE);
     path_finder->initGridNodeMap(_resolution, _map_origin);
 
+    // ========== 碰撞检测地图初始化 ==========
+    // 设置地图坐标变换(从地图原点到世界坐标系)
     Translation3d origin_translation( _map_origin(0), _map_origin(1), 0.0);
-    Quaterniond origin_rotation(1.0, 0.0, 0.0, 0.0);
+    Quaterniond origin_rotation(1.0, 0.0, 0.0, 0.0);  // 无旋转
     Affine3d origin_transform = origin_translation * origin_rotation;
+    
+    // 创建全局碰撞检测地图
     collision_map = new CollisionMapGrid(origin_transform, "world", _resolution, _x_size, _y_size, _z_size, _free_cell);
 
-    ros::Rate rate(100);
+    // ========== 主循环 ==========
+    ros::Rate rate(100);  // 设置循环频率为100Hz
     bool status = ros::ok();
     while(status) 
     {
-        ros::spinOnce();           
-        status = ros::ok();
-        rate.sleep();
+        ros::spinOnce();   // 处理回调函数        
+        status = ros::ok(); // 检查ROS状态
+        rate.sleep();      // 维持循环频率
     }
 
-    return 0;
+    return 0;  // 程序正常退出
 }
 
+/**
+ * @brief 将内部贝塞尔系数转换为ROS轨迹消息格式
+ * 
+ * 将优化后的贝塞尔曲线系数打包成ROS消息，用于发布给轨迹跟踪控制器
+ * 
+ * @return quadrotor_msgs::PolynomialTrajectory 轨迹消息
+ */
 quadrotor_msgs::PolynomialTrajectory getBezierTraj()
 {
     quadrotor_msgs::PolynomialTrajectory traj;
-      traj.action = quadrotor_msgs::PolynomialTrajectory::ACTION_ADD;
-      traj.num_segment = _seg_num;
+    traj.action = quadrotor_msgs::PolynomialTrajectory::ACTION_ADD;  // 设置为添加新轨迹
+    traj.num_segment = _seg_num;  // 轨迹段数
 
-      int order = _traj_order;
-      int poly_num1d = order + 1;
-      int polyTotalNum = _seg_num * (order + 1);
+    // ========== 系数矩阵维度计算 ==========
+    int order = _traj_order;                    // 贝塞尔曲线阶数
+    int poly_num1d = order + 1;                 // 单轴控制点数量
+    int polyTotalNum = _seg_num * (order + 1);  // 总系数数量
 
-      traj.coef_x.resize(polyTotalNum);
-      traj.coef_y.resize(polyTotalNum);
-      traj.coef_z.resize(polyTotalNum);
+    // ========== 系数数组初始化 ==========
+    traj.coef_x.resize(polyTotalNum);  // X轴系数数组
+    traj.coef_y.resize(polyTotalNum);  // Y轴系数数组  
+    traj.coef_z.resize(polyTotalNum);  // Z轴系数数组
 
-      int idx = 0;
-      for(int i = 0; i < _seg_num; i++ )
-      {    
-          for(int j =0; j < poly_num1d; j++)
-          { 
-              traj.coef_x[idx] = _bezier_coeff(i,                  j);
-              traj.coef_y[idx] = _bezier_coeff(i,     poly_num1d + j);
-              traj.coef_z[idx] = _bezier_coeff(i, 2 * poly_num1d + j);
-              idx++;
-          }
-      }
+    // ========== 系数数据填充 ==========
+    // 将内部系数矩阵转换为线性数组格式
+    int idx = 0;
+    for(int i = 0; i < _seg_num; i++ )  // 遍历每个轨迹段
+    {    
+        for(int j = 0; j < poly_num1d; j++)  // 遍历每个控制点
+        { 
+            // 按段-轴-控制点的顺序填充系数
+            traj.coef_x[idx] = _bezier_coeff(i,                  j);  // X轴第j个控制点
+            traj.coef_y[idx] = _bezier_coeff(i,     poly_num1d + j);  // Y轴第j个控制点
+            traj.coef_z[idx] = _bezier_coeff(i, 2 * poly_num1d + j);  // Z轴第j个控制点
+            idx++;
+        }
+    }
 
-      traj.header.frame_id = "/bernstein";
-      traj.header.stamp = _odom.header.stamp; 
-      _start_time = traj.header.stamp;
+    // ========== 消息头设置 ==========
+    traj.header.frame_id = "/bernstein";         // 坐标系标识
+    traj.header.stamp = _odom.header.stamp;      // 时间戳(与里程计同步)
+    _start_time = traj.header.stamp;             // 记录轨迹开始时间
 
-      traj.time.resize(_seg_num);
-      traj.order.resize(_seg_num);
+    // ========== 时间和阶数信息 ==========
+    traj.time.resize(_seg_num);   // 各段时间数组
+    traj.order.resize(_seg_num);  // 各段阶数数组
 
-      traj.mag_coeff = 1.0;
-      for (int idx = 0; idx < _seg_num; ++idx){
-          traj.time[idx] = _seg_time(idx);
-          traj.order[idx] = _traj_order;
-      }
-      
-      traj.start_yaw = 0.0;
-      traj.final_yaw = 0.0;
+    traj.mag_coeff = 1.0;  // 幅度系数(通常为1.0)
+    for (int idx = 0; idx < _seg_num; ++idx){
+        traj.time[idx] = _seg_time(idx);  // 设置第idx段的持续时间
+        traj.order[idx] = _traj_order;    // 设置第idx段的多项式阶数
+    }
+    
+    // ========== 偏航角设置 ==========
+    traj.start_yaw = 0.0;  // 起始偏航角
+    traj.final_yaw = 0.0;  // 终止偏航角
 
-      traj.trajectory_id = _traj_id;
-      traj.action = quadrotor_msgs::PolynomialTrajectory::ACTION_ADD;
+    // ========== 轨迹标识 ==========
+    traj.trajectory_id = _traj_id;  // 轨迹唯一标识符
+    traj.action = quadrotor_msgs::PolynomialTrajectory::ACTION_ADD;  // 确认添加动作
 
-      return traj;
+    return traj;
 }
 
+/**
+ * @brief 从贝塞尔系数计算指定时间的位置
+ * 
+ * 使用贝塞尔基函数和控制点计算轨迹在指定时间的三维位置
+ * 
+ * @param polyCoeff 贝塞尔系数矩阵，每行为一段轨迹，列为[x控制点, y控制点, z控制点]
+ * @param t_now 当前时间(归一化到[0,1])
+ * @param seg_now 当前轨迹段索引
+ * @return Vector3d 三维位置向量[x, y, z]
+ */
 Vector3d getPosFromBezier(const MatrixXd & polyCoeff, double t_now, int seg_now )
 {
-    Vector3d ret = VectorXd::Zero(3);
-    VectorXd ctrl_now = polyCoeff.row(seg_now);
-    int ctrl_num1D = polyCoeff.cols() / 3;
+    Vector3d ret = VectorXd::Zero(3);  // 初始化返回位置向量
+    VectorXd ctrl_now = polyCoeff.row(seg_now);  // 获取当前段的控制点
+    int ctrl_num1D = polyCoeff.cols() / 3;       // 单轴控制点数量
 
+    // ========== 贝塞尔曲线位置计算 ==========
+    // 对每个轴(x, y, z)分别计算
     for(int i = 0; i < 3; i++)
+        // 对每个控制点进行贝塞尔基函数计算
         for(int j = 0; j < ctrl_num1D; j++)
+            // 贝塞尔基函数: C_j * t^j * (1-t)^(n-j)
             ret(i) += _C(j) * ctrl_now(i * ctrl_num1D + j) * pow(t_now, j) * pow((1 - t_now), (_traj_order - j) ); 
 
     return ret;  
 }
 
+/**
+ * @brief 从贝塞尔系数计算指定时间的完整状态
+ * 
+ * 计算轨迹在指定时间的位置、速度、加速度和急动度(jerk)
+ * 
+ * @param polyCoeff 贝塞尔系数矩阵
+ * @param t_now 当前时间(归一化到[0,1])  
+ * @param seg_now 当前轨迹段索引
+ * @return VectorXd 12维状态向量[x,y,z, vx,vy,vz, ax,ay,az, jx,jy,jz]
+ */
 VectorXd getStateFromBezier(const MatrixXd & polyCoeff, double t_now, int seg_now )
 {
-    VectorXd ret = VectorXd::Zero(12);
+    VectorXd ret = VectorXd::Zero(12);  // 初始化12维状态向量
 
-    VectorXd ctrl_now = polyCoeff.row(seg_now);
-    int ctrl_num1D = polyCoeff.cols() / 3;
+    VectorXd ctrl_now = polyCoeff.row(seg_now);  // 获取当前段控制点
+    int ctrl_num1D = polyCoeff.cols() / 3;       // 单轴控制点数量
 
-    for(int i = 0; i < 3; i++)
+    // ========== 计算位置、速度、加速度、急动度 ==========
+    for(int i = 0; i < 3; i++)  // 对每个轴(x, y, z)
     {   
         for(int j = 0; j < ctrl_num1D; j++){
+            // ===== 位置计算 (0阶导数) =====
             ret[i] += _C(j) * ctrl_now(i * ctrl_num1D + j) * pow(t_now, j) * pow((1 - t_now), (_traj_order - j) ); 
           
+            // ===== 速度计算 (1阶导数) =====
             if(j < ctrl_num1D - 1 )
                 ret[i+3] += _Cv(j) * _traj_order 
-                      * ( ctrl_now(i * ctrl_num1D + j + 1) - ctrl_now(i * ctrl_num1D + j))
+                      * ( ctrl_now(i * ctrl_num1D + j + 1) - ctrl_now(i * ctrl_num1D + j))  // 控制点差分
                       * pow(t_now, j) * pow((1 - t_now), (_traj_order - j - 1) ); 
           
+            // ===== 加速度计算 (2阶导数) =====
             if(j < ctrl_num1D - 2 )
                 ret[i+6] += _Ca(j) * _traj_order * (_traj_order - 1) 
-                      * ( ctrl_now(i * ctrl_num1D + j + 2) - 2 * ctrl_now(i * ctrl_num1D + j + 1) + ctrl_now(i * ctrl_num1D + j))
+                      * ( ctrl_now(i * ctrl_num1D + j + 2) - 2 * ctrl_now(i * ctrl_num1D + j + 1) + ctrl_now(i * ctrl_num1D + j))  // 二阶差分
                       * pow(t_now, j) * pow((1 - t_now), (_traj_order - j - 2) );                         
 
+            // ===== 急动度计算 (3阶导数) =====
             if(j < ctrl_num1D - 3 )
                 ret[i+9] += _Cj(j) * _traj_order * (_traj_order - 1) * (_traj_order - 2) 
-                      * ( ctrl_now(i * ctrl_num1D + j + 3) - 3 * ctrl_now(i * ctrl_num1D + j + 2) + 3 * ctrl_now(i * ctrl_num1D + j + 1) - ctrl_now(i * ctrl_num1D + j))
+                      * ( ctrl_now(i * ctrl_num1D + j + 3) - 3 * ctrl_now(i * ctrl_num1D + j + 2) 
+                        + 3 * ctrl_now(i * ctrl_num1D + j + 1) - ctrl_now(i * ctrl_num1D + j))  // 三阶差分
                       * pow(t_now, j) * pow((1 - t_now), (_traj_order - j - 3) );                         
         }
     }
@@ -1354,104 +1483,136 @@ VectorXd getStateFromBezier(const MatrixXd & polyCoeff, double t_now, int seg_no
     return ret;  
 }
 
+// ==================== 可视化函数块 ====================
+
+/**
+ * @brief 可视化Fast Marching路径
+ * 
+ * 将Fast Marching算法生成的路径显示为白色立方体序列
+ * 
+ * @param path 路径点向量，每个点为3D坐标
+ */
 visualization_msgs::MarkerArray path_vis; 
 void visPath(vector<Vector3d> path)
 {
+    // ========== 清除旧的路径显示 ==========
     for(auto & mk: path_vis.markers) 
-        mk.action = visualization_msgs::Marker::DELETE;
+        mk.action = visualization_msgs::Marker::DELETE;  // 标记为删除
 
-    _fm_path_vis_pub.publish(path_vis);
-    path_vis.markers.clear();
+    _fm_path_vis_pub.publish(path_vis);  // 发布删除指令
+    path_vis.markers.clear();            // 清空本地标记数组
 
+    // ========== 创建新的路径标记 ==========
     visualization_msgs::Marker mk;
-    mk.header.frame_id = "world";
-    mk.header.stamp = ros::Time::now();
-    mk.ns = "b_traj/fast_marching_path";
-    mk.type = visualization_msgs::Marker::CUBE;
-    mk.action = visualization_msgs::Marker::ADD;
+    mk.header.frame_id = "world";              // 世界坐标系
+    mk.header.stamp = ros::Time::now();        // 当前时间戳
+    mk.ns = "b_traj/fast_marching_path";       // 命名空间
+    mk.type = visualization_msgs::Marker::CUBE; // 立方体类型
+    mk.action = visualization_msgs::Marker::ADD; // 添加标记
 
-    mk.pose.orientation.x = 0.0;
+    // ========== 设置标记外观 ==========
+    mk.pose.orientation.x = 0.0;  // 无旋转
     mk.pose.orientation.y = 0.0;
     mk.pose.orientation.z = 0.0;
     mk.pose.orientation.w = 1.0;
-    mk.color.a = 0.6;
-    mk.color.r = 1.0;
+    mk.color.a = 0.6;   // 透明度
+    mk.color.r = 1.0;   // 白色
     mk.color.g = 1.0;
     mk.color.b = 1.0;
 
+    // ========== 为每个路径点创建立方体 ==========
     int idx = 0;
     for(int i = 0; i < int(path.size()); i++)
     {
-        mk.id = idx;
+        mk.id = idx;  // 唯一标识符
 
+        // 设置位置
         mk.pose.position.x = path[i](0); 
         mk.pose.position.y = path[i](1); 
         mk.pose.position.z = path[i](2);  
 
+        // 设置尺寸(与地图分辨率一致)
         mk.scale.x = _resolution;
         mk.scale.y = _resolution;
         mk.scale.z = _resolution;
 
         idx ++;
-        path_vis.markers.push_back(mk);
+        path_vis.markers.push_back(mk);  // 添加到标记数组
     }
 
-    _fm_path_vis_pub.publish(path_vis);
+    _fm_path_vis_pub.publish(path_vis);  // 发布可视化
 }
 
+/**
+ * @brief 可视化飞行走廊
+ * 
+ * 将生成的安全飞行走廊显示为半透明白色立方体
+ * 支持2D投影模式(压扁到地面)和3D模式
+ * 
+ * @param corridor 飞行走廊立方体向量
+ */
 visualization_msgs::MarkerArray cube_vis;
 void visCorridor(vector<Cube> corridor)
 {   
+    // ========== 清除旧的走廊显示 ==========
     for(auto & mk: cube_vis.markers) 
         mk.action = visualization_msgs::Marker::DELETE;
     
-    _corridor_vis_pub.publish(cube_vis);
+    _corridor_vis_pub.publish(cube_vis);  // 发布删除指令
+    cube_vis.markers.clear();             // 清空标记数组
 
-    cube_vis.markers.clear();
-
+    // ========== 创建新的走廊标记 ==========
     visualization_msgs::Marker mk;
-    mk.header.frame_id = "world";
-    mk.header.stamp = ros::Time::now();
-    mk.ns = "corridor";
-    mk.type = visualization_msgs::Marker::CUBE;
-    mk.action = visualization_msgs::Marker::ADD;
+    mk.header.frame_id = "world";                // 世界坐标系
+    mk.header.stamp = ros::Time::now();          // 当前时间戳
+    mk.ns = "corridor";                          // 命名空间
+    mk.type = visualization_msgs::Marker::CUBE;  // 立方体类型
+    mk.action = visualization_msgs::Marker::ADD; // 添加标记
 
-    mk.pose.orientation.x = 0.0;
+    // ========== 设置标记外观 ==========
+    mk.pose.orientation.x = 0.0;  // 无旋转
     mk.pose.orientation.y = 0.0;
     mk.pose.orientation.z = 0.0;
     mk.pose.orientation.w = 1.0;
 
-    mk.color.a = 0.4;
-    mk.color.r = 1.0;
+    mk.color.a = 0.4;   // 半透明
+    mk.color.r = 1.0;   // 白色
     mk.color.g = 1.0;
     mk.color.b = 1.0;
 
+    // ========== 为每个走廊立方体创建标记 ==========
     int idx = 0;
     for(int i = 0; i < int(corridor.size()); i++)
     {   
-        mk.id = idx;
+        mk.id = idx;  // 唯一标识符
 
+        // ===== 计算立方体中心位置 =====
+        // X中心: (前后顶点平均)
         mk.pose.position.x = (corridor[i].vertex(0, 0) + corridor[i].vertex(3, 0) ) / 2.0; 
+        // Y中心: (左右顶点平均)
         mk.pose.position.y = (corridor[i].vertex(0, 1) + corridor[i].vertex(1, 1) ) / 2.0; 
 
+        // Z中心: 根据投影模式确定
         if(_is_proj_cube)
-            mk.pose.position.z = 0.0; 
+            mk.pose.position.z = 0.0;  // 投影到地面
         else
-            mk.pose.position.z = (corridor[i].vertex(0, 2) + corridor[i].vertex(4, 2) ) / 2.0; 
+            mk.pose.position.z = (corridor[i].vertex(0, 2) + corridor[i].vertex(4, 2) ) / 2.0;  // 3D中心
 
-        mk.scale.x = (corridor[i].vertex(0, 0) - corridor[i].vertex(3, 0) );
-        mk.scale.y = (corridor[i].vertex(1, 1) - corridor[i].vertex(0, 1) );
+        // ===== 计算立方体尺寸 =====
+        mk.scale.x = (corridor[i].vertex(0, 0) - corridor[i].vertex(3, 0) );  // X方向尺寸
+        mk.scale.y = (corridor[i].vertex(1, 1) - corridor[i].vertex(0, 1) );  // Y方向尺寸
 
+        // Z方向尺寸: 根据投影模式确定
         if(_is_proj_cube)
-            mk.scale.z = 0.05; 
+            mk.scale.z = 0.05;   // 投影模式: 薄片状
         else
-            mk.scale.z = (corridor[i].vertex(0, 2) - corridor[i].vertex(4, 2) );
+            mk.scale.z = (corridor[i].vertex(0, 2) - corridor[i].vertex(4, 2) );  // 3D模式: 实际高度
 
         idx ++;
-        cube_vis.markers.push_back(mk);
+        cube_vis.markers.push_back(mk);  // 添加到标记数组
     }
 
-    _corridor_vis_pub.publish(cube_vis);
+    _corridor_vis_pub.publish(cube_vis);  // 发布可视化
 }
 
 void visBezierTrajectory(MatrixXd polyCoeff, VectorXd time)
